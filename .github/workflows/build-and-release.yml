@@ -16,18 +16,12 @@ jobs:
     outputs:
       release_id: ${{ steps.create-release.outputs.id }}
     steps:
-      - name: Checkout private repository
-        uses: actions/checkout@v4
-        with:
-          repository: Rafi718/lokaclip_desktop
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          
       - id: create-release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: "Loka Clip ${{ github.ref_name }}"
-          body_path: RELEASE_NOTES.md
+          body: "See the assets below to download and install."
           draft: false
           prerelease: false
 
