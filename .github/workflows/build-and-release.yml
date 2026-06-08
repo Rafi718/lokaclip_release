@@ -80,6 +80,12 @@ jobs:
         with:
           version: 9
 
+      - name: Create .env file
+        run: |
+          echo "VITE_API_BASE_URL=https://api.lokaclip.pro/v1" > .env
+          echo "VITE_APP_VERSION=${{ github.ref_name }}" >> .env
+          echo "VITE_UPDATE_CHANNEL=stable" >> .env
+
       - name: Install frontend dependencies
         run: pnpm install
 
