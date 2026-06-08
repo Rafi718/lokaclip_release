@@ -22,7 +22,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: "Loka Clip ${{ github.ref_name }}"
           body: "See the assets below to download and install."
-          draft: true
+          draft: false
           prerelease: false
 
   build:
