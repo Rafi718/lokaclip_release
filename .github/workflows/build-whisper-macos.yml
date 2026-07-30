@@ -1,0 +1,187 @@
+# Build whisper.cpp for macOS and publish it as a release asset.
+#
+# Upstream ships prebuilt binaries for Windows and Linux, but for Apple only
+# an Xcode xcframework — there is no CLI to download. Lokaclip needs one it
+# can fetch at runtime like ffmpeg and yt-dlp, so we build it here.
+#
+# Run it by hand from the Actions tab whenever whisper.cpp cuts a release
+# worth taking. It is not on a schedule: a silent auto-bump is how a working
+# transcription pipeline breaks overnight.
+name: Build whisper.cpp (macOS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_version:
+        description: "whisper.cpp tag to build (e.g. v1.9.1)"
+        required: true
+        default: "v1.9.1"
+
+permissions:
+  contents: write
+
+env:
+  # Pinned on purpose, and this is the whole point of the file.
+  #
+  # A GitHub macOS runner without an explicit deployment target stamps
+  # whatever version the runner happens to be on. That is not hypothetical:
+  # the ffmpeg builds Lokaclip depends on were produced that way, and when
+  # the runners moved to macOS 15 the binaries began aborting at launch on
+  # every older Mac — with no app update, no error the user could read, and
+  # days lost to diagnosis. Raise these only deliberately.
+  #
+  # arm64 is 13.0 because ggml's Metal backend expects a reasonably modern
+  # Metal; x86_64 goes lower because Intel users are the ones still on old
+  # macOS, and that build has no Metal to worry about.
+  DEPLOYMENT_TARGET_ARM64: "13.0"
+  DEPLOYMENT_TARGET_X64: "12.0"
+
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            # Metal, with the shader library compiled into the executable.
+            # Without EMBED_LIBRARY the binary looks for ggml-metal.metal
+            # next to itself at runtime and silently falls back to CPU when
+            # it cannot find it — a 5x slowdown that reports no error.
+            cmake_args: >-
+              -DCMAKE_OSX_ARCHITECTURES=arm64
+              -DGGML_METAL=ON
+              -DGGML_METAL_EMBED_LIBRARY=ON
+          - arch: x64
+            # Cross-compiled from the arm64 runner. Metal is off: ggml's
+            # Metal path is unreliable on Intel GPUs, and a wrong-but-quiet
+            # GPU path is worse than an honest CPU one.
+            cmake_args: >-
+              -DCMAKE_OSX_ARCHITECTURES=x86_64
+              -DGGML_METAL=OFF
+
+    steps:
+      - name: Check out whisper.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ inputs.whisper_version }}
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            TARGET="${DEPLOYMENT_TARGET_ARM64}"
+          else
+            TARGET="${DEPLOYMENT_TARGET_X64}"
+          fi
+          echo "MIN_OS=$TARGET" >> "$GITHUB_ENV"
+
+          # BUILD_SHARED_LIBS=OFF is deliberate. Lokaclip downloads this
+          # binary at runtime into its app-support folder, and a hardened
+          # macOS runtime refuses to load unsigned dylibs fetched that way —
+          # the same Library Validation problem that hung Smart Crop when
+          # onnxruntime shipped as a dylib. One self-contained executable
+          # sidesteps it entirely.
+          # GGML_NATIVE=OFF is not optional here, for the same reason the
+          # deployment target is pinned: left on (its default), ggml probes
+          # the *build machine's* CPU and bakes in `-mcpu=<that chip>`. On a
+          # runner that breaks the x86_64 cross-compile outright with
+          # "unknown target CPU 'apple-m1'", and — quieter and worse — it
+          # would tune the arm64 binary to whichever Apple chip the runner
+          # happens to have. The day GitHub moves these runners to a newer
+          # chip, the published binary could stop running on older Macs.
+          # That is the ffmpeg outage all over again, in a second dimension.
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_SERVER=OFF \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$TARGET" \
+            ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Verify the binary before we ship it
+        run: |
+          BIN=build/bin/whisper-cli
+          test -f "$BIN" || { echo "::error::whisper-cli was not produced"; exit 1; }
+
+          echo "--- architecture ---"
+          file "$BIN"
+          EXPECTED_ARCH=$([ "${{ matrix.arch }}" = "arm64" ] && echo arm64 || echo x86_64)
+          lipo -archs "$BIN" | grep -qw "$EXPECTED_ARCH" || {
+            echo "::error::built for $(lipo -archs "$BIN"), expected $EXPECTED_ARCH"; exit 1; }
+
+          # The check that would have caught the ffmpeg outage. dyld aborts a
+          # binary whose minos exceeds the running OS, so a drifted runner
+          # must fail the build here rather than ship a binary that dies on
+          # a user's Mac with no readable error.
+          echo "--- deployment target ---"
+          MINOS=$(otool -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+          echo "minos=$MINOS expected=$MIN_OS"
+          [ "$MINOS" = "$MIN_OS" ] || {
+            echo "::error::minos $MINOS != $MIN_OS — the runner overrode the deployment target"; exit 1; }
+
+          # Anything beyond the OS-provided frameworks means we did not get a
+          # self-contained executable, and the download-at-runtime model breaks.
+          echo "--- linked libraries ---"
+          otool -L "$BIN"
+          STRAY=$(otool -L "$BIN" | tail -n +2 \
+            | grep -vE '/usr/lib/|/System/Library/' || true)
+          [ -z "$STRAY" ] || {
+            echo "::error::binary is not self-contained:"; echo "$STRAY"; exit 1; }
+
+      - name: Smoke test
+        # Linking cleanly is not the same as running: a binary can still
+        # abort on a missing Metal shader or a bad cross-compile.
+        run: |
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            ./build/bin/whisper-cli --help > /dev/null
+            echo "arm64 binary runs"
+          else
+            # The runner is Apple Silicon, so the Intel build needs Rosetta.
+            # Best-effort: if Rosetta is absent this proves nothing, and
+            # failing the build over a missing emulator would be wrong.
+            if arch -x86_64 /usr/bin/true 2>/dev/null; then
+              arch -x86_64 ./build/bin/whisper-cli --help > /dev/null
+              echo "x64 binary runs under Rosetta"
+            else
+              echo "::warning::Rosetta unavailable — x64 binary shipped unexecuted"
+            fi
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/bin/whisper-cli dist/
+          cd dist
+          tar -czf "whisper-cli-macos-${{ matrix.arch }}.tar.gz" whisper-cli
+          shasum -a 256 "whisper-cli-macos-${{ matrix.arch }}.tar.gz" \
+            > "whisper-cli-macos-${{ matrix.arch }}.tar.gz.sha256"
+          ls -la
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          # Namespaced so these never collide with Loka Clip's own `v*` app
+          # releases in this repo.
+          tag_name: whisper-${{ inputs.whisper_version }}
+          name: "whisper.cpp ${{ inputs.whisper_version }} (macOS)"
+          body: |
+            macOS builds of `whisper-cli` from
+            [whisper.cpp ${{ inputs.whisper_version }}](https://github.com/ggml-org/whisper.cpp/releases/tag/${{ inputs.whisper_version }}),
+            for Loka Clip to download at runtime.
+
+            Statically linked, no dylibs. Metal is compiled in on arm64.
+
+            | Asset | Arch | Min macOS | GPU |
+            |---|---|---|---|
+            | `whisper-cli-macos-arm64.tar.gz` | Apple Silicon | ${{ env.DEPLOYMENT_TARGET_ARM64 }} | Metal |
+            | `whisper-cli-macos-x64.tar.gz` | Intel | ${{ env.DEPLOYMENT_TARGET_X64 }} | CPU |
+
+            Models are not included — Loka Clip downloads those separately.
+          files: |
+            dist/whisper-cli-macos-${{ matrix.arch }}.tar.gz
+            dist/whisper-cli-macos-${{ matrix.arch }}.tar.gz.sha256
