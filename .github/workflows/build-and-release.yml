@@ -87,3 +87,37 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+  # Check the one URL every installed copy of Loka Clip actually calls.
+  #
+  # A release can be green in every build job and still leave the updater
+  # broken, because `/releases/latest/` resolves to whichever release in this
+  # repo is newest — not to this one. Publishing anything else here silently
+  # steals that slot, the endpoint 404s, and nobody finds out until a user
+  # reports that updates stopped working. That has already happened once.
+  #
+  # Fetching the endpoint the client fetches is the only check that would
+  # have caught it.
+  verify-updater:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Updater endpoint serves this release
+        run: |
+          EXPECTED="${GITHUB_REF_NAME#v}"
+          URL="https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
+
+          # GitHub caches the /latest redirect briefly, so a fresh release can
+          # take a moment to surface. Retry rather than fail on a cold cache.
+          for attempt in 1 2 3 4 5 6; do
+            BODY=$(curl -sL --fail "$URL?cb=$RANDOM" 2>/dev/null) &&               SERVED=$(echo "$BODY" | jq -r '.version // empty') || SERVED=""
+            echo "attempt $attempt: served='${SERVED:-<none>}' expected='$EXPECTED'"
+            [ "$SERVED" = "$EXPECTED" ] && { echo "updater OK"; exit 0; }
+            sleep 20
+          done
+
+          echo "::error::Updater endpoint does not serve $EXPECTED."
+          echo "::error::Most likely another release in this repo is newer and"
+          echo "::error::claimed /releases/latest. Binaries and other artifacts"
+          echo "::error::belong in Rafi718/lokaclip-binaries, not here."
+          exit 1
