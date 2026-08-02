@@ -44,10 +44,17 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
+      # Check out the *tag*, not the branch tip. Without `ref` this built
+      # whatever happened to be on main at the second the workflow started,
+      # which is how v1.8.0 came to be published from a tree still carrying
+      # version 1.7.8 — an empty release, recovered by re-tagging as v1.8.1
+      # ninety seconds later. `scripts/release.mjs` pushes the matching tag to
+      # lokaclip_desktop before it pushes this one, so the ref always exists.
       - name: Checkout private repository
         uses: actions/checkout@v4
         with:
           repository: Rafi718/lokaclip_desktop
+          ref: ${{ github.ref_name }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
 
       - name: Setup Node.js
@@ -76,6 +83,38 @@ jobs:
 
       - name: Install frontend dependencies
         run: pnpm install
+
+      # Smart Crop loads onnxruntime.dll, which imports MSVCP140,
+      # MSVCP140_1, VCRUNTIME140 and VCRUNTIME140_1 — the Visual C++
+      # runtime. None of those ship with Windows, and we install none of
+      # them, so on a machine that has never had a Visual Studio
+      # redistributable the load fails with ERROR_MOD_NOT_FOUND and every
+      # clip in the render queue dies. A user hit exactly that without ever
+      # asking for face tracking: the Podcast content preset enables it.
+      #
+      # The runner has Visual Studio, so take them from its redist folder —
+      # the copy Microsoft licenses for redistribution — rather than
+      # committing binaries or hosting them ourselves. `preload_vc_runtime`
+      # in smartcrop/onnx.rs loads them from here by absolute path.
+      - name: Bundle the Visual C++ runtime (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $dest = "src-tauri/resources/vcruntime"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $src = Get-ChildItem -Directory -ErrorAction SilentlyContinue `
+            "C:\Program Files*\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $src) { throw "VC redist folder not found on this runner" }
+          Write-Host "Using $($src.FullName)"
+          # Fail the build rather than ship a package that is quietly broken
+          # for exactly the users who cannot diagnose it.
+          foreach ($f in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","msvcp140_1.dll")) {
+            $p = Join-Path $src.FullName $f
+            if (-not (Test-Path $p)) { throw "missing $f in $($src.FullName)" }
+            Copy-Item $p $dest -Force
+          }
+          Get-ChildItem $dest | Format-Table Name, Length
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
