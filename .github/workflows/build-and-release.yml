@@ -29,6 +29,9 @@ jobs:
     needs: create-release
     strategy:
       fail-fast: false
+      # Every target updates the same release and latest.json. Serial uploads
+      # prevent one matrix job from deleting/replacing another job's manifest.
+      max-parallel: 1
       matrix:
         include:
           - platform: windows-latest
@@ -80,6 +83,7 @@ jobs:
           echo "VITE_API_BASE_URL=https://api.lokaclip.pro/v1" > .env
           echo "VITE_APP_VERSION=${{ github.ref_name }}" >> .env
           echo "VITE_UPDATE_CHANNEL=stable" >> .env
+          echo "VITE_TELEMETRY_ENABLED=true" >> .env
 
       - name: Install frontend dependencies
         run: pnpm install
@@ -125,6 +129,7 @@ jobs:
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           includeUpdaterJson: true
+          retryAttempts: 3
           args: ${{ matrix.args }}
 
   # Check the one URL every installed copy of Loka Clip actually calls.
