@@ -154,13 +154,21 @@ jobs:
           # GitHub caches the /latest redirect briefly, so a fresh release can
           # take a moment to surface. Retry rather than fail on a cold cache.
           for attempt in 1 2 3 4 5 6; do
-            BODY=$(curl -sL --fail "$URL?cb=$RANDOM" 2>/dev/null) &&               SERVED=$(echo "$BODY" | jq -r '.version // empty') || SERVED=""
+            BODY=$(curl -sL --fail "$URL?cb=$RANDOM" 2>/dev/null) && SERVED=$(echo "$BODY" | jq -r '.version // empty') || SERVED=""
             echo "attempt $attempt: served='${SERVED:-<none>}' expected='$EXPECTED'"
-            [ "$SERVED" = "$EXPECTED" ] && { echo "updater OK"; exit 0; }
+            if [ "$SERVED" = "$EXPECTED" ] && echo "$BODY" | jq -e '
+              . as $manifest | all(
+                ["windows-x86_64-nsis", "windows-x86_64-msi", "darwin-x86_64-app", "darwin-aarch64-app"][];
+                . as $target | $manifest.platforms[$target] | (.url and .signature)
+              )
+            ' >/dev/null; then
+              echo "updater manifest OK"
+              exit 0
+            fi
             sleep 20
           done
 
-          echo "::error::Updater endpoint does not serve $EXPECTED."
+          echo "::error::Updater endpoint does not serve a complete manifest for $EXPECTED."
           echo "::error::Most likely another release in this repo is newer and"
           echo "::error::claimed /releases/latest. Binaries and other artifacts"
           echo "::error::belong in Rafi718/lokaclip-binaries, not here."
