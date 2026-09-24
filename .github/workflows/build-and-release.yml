@@ -22,7 +22,16 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: "Loka Clip ${{ github.ref_name }}"
           body: "See the assets below to download and install."
-          draft: false
+          # Draft until every platform is in latest.json (see publish-release).
+          # A published release claims /releases/latest the moment it exists,
+          # and the builds below run one at a time for a long while. For that
+          # whole window every installed app polled a release with no
+          # latest.json ("Could not fetch a valid release JSON"), then one
+          # listing only Windows ("None of the fallback platforms
+          # darwin-aarch64"). Telemetry showed both on every release. Drafts
+          # never become latest, so users keep the previous release until
+          # this one is complete.
+          draft: true
           prerelease: false
 
   build:
@@ -118,6 +127,19 @@ jobs:
             if (-not (Test-Path $p)) { throw "missing $f in $($src.FullName)" }
             Copy-Item $p $dest -Force
           }
+          # Local transcription needs one more: whisper.cpp's ggml DLLs are
+          # built with OpenMP and import VCOMP140.DLL, which lives in the
+          # sibling Microsoft.VC*.OpenMP folder, not the CRT one. The app
+          # copies this whole folder next to whisper-cli.exe
+          # (platform::provide_vc_runtime), because whisper runs as its own
+          # process and cannot see the in-process preload Smart Crop uses.
+          $omp = Get-ChildItem -Directory -ErrorAction SilentlyContinue `
+            (Join-Path (Split-Path $src.FullName) "Microsoft.VC*.OpenMP") |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $omp) { throw "OpenMP redist folder not found next to $($src.FullName)" }
+          $p = Join-Path $omp.FullName "vcomp140.dll"
+          if (-not (Test-Path $p)) { throw "missing vcomp140.dll in $($omp.FullName)" }
+          Copy-Item $p $dest -Force
           Get-ChildItem $dest | Format-Table Name, Length
 
       - name: Build Tauri app
@@ -128,6 +150,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
+          # Draft assets have `untagged-…` download URLs until publication;
+          # tauri-action rewrites them to this tag in latest.json.
+          tagName: ${{ github.ref_name }}
           includeUpdaterJson: true
           retryAttempts: 3
           args: ${{ matrix.args }}
@@ -142,8 +167,22 @@ jobs:
   #
   # Fetching the endpoint the client fetches is the only check that would
   # have caught it.
-  verify-updater:
+  # Publish only after every build job succeeded. If any failed, the release
+  # stays a draft and installed apps keep updating to the previous version
+  # instead of to a manifest that lacks their platform.
+  publish-release:
     needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --draft=false --latest
+
+  verify-updater:
+    needs: publish-release
     runs-on: ubuntu-22.04
     steps:
       - name: Updater endpoint serves this release
