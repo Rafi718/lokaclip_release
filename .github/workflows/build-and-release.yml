@@ -142,12 +142,30 @@ jobs:
           Copy-Item $p $dest -Force
           Get-ChildItem $dest | Format-Table Name, Length
 
+      # The device-proof signing key (src-tauri/src/services/device_proof.rs,
+      # baked in by build.rs) must come from repository secrets. Without them
+      # the build silently uses the dev key, which production rejects — every
+      # free user would be refused the trial. Fail loudly instead.
+      - name: Require device signing key
+        shell: bash
+        env:
+          KEY: ${{ secrets.LOKACLIP_DEVICE_KEY }}
+          KID: ${{ secrets.LOKACLIP_DEVICE_KID }}
+        run: |
+          if [ ${#KEY} -lt 32 ] || [ -z "$KID" ]; then
+            echo "::error::Set repository secrets LOKACLIP_DEVICE_KEY (32+ chars) and LOKACLIP_DEVICE_KID"
+            exit 1
+          fi
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Read by src-tauri/build.rs; must match DEVICE_SIGNING_KEYS on the API.
+          LOKACLIP_DEVICE_KEY: ${{ secrets.LOKACLIP_DEVICE_KEY }}
+          LOKACLIP_DEVICE_KID: ${{ secrets.LOKACLIP_DEVICE_KID }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           # Draft assets have `untagged-…` download URLs until publication;
