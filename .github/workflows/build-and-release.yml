@@ -157,6 +157,42 @@ jobs:
             exit 1
           fi
 
+      # The bundler downloads NSIS from GitHub after everything has compiled,
+      # and 504s there failed v2.3.0: `retryAttempts` below gave up after four
+      # attempts over 12 minutes, each recompiling. Fetch the toolset here and
+      # wait the outage out for the cost of a sleep; the bundler then finds it
+      # in place and downloads nothing. actions/cache would not help: this
+      # workflow only runs on tags, and a tag's cache is invisible to the next.
+      #
+      # URLs, hashes and layout mirror nsis/mod.rs in tauri-cli 2.11.2. A
+      # later CLI that wants other files fetches them itself, so outdated
+      # values only lose this head start. Same reason a failure here must
+      # not stop the build.
+      - name: Pre-fetch the NSIS toolset (Windows)
+        if: matrix.platform == 'windows-latest'
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: pwsh
+        run: |
+          function Get-Verified($url, $sha1, $out) {
+            curl.exe -fsSL --retry 40 --retry-all-errors --retry-delay 30 --max-time 180 -o $out $url
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $url" }
+            if ((Get-FileHash -Algorithm SHA1 $out).Hash -ne $sha1) { throw "hash mismatch: $url" }
+          }
+          $base = "https://github.com/tauri-apps"
+          $zip = Join-Path $env:RUNNER_TEMP "nsis.zip"
+          $dll = Join-Path $env:RUNNER_TEMP "nsis_tauri_utils.dll"
+          Get-Verified "$base/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip" "EF7FF767E5CBD9EDD22ADD3A32C9B8F4500BB10D" $zip
+          Get-Verified "$base/nsis-tauri-utils/releases/download/nsis_tauri_utils-v0.5.3/nsis_tauri_utils.dll" "75197FEE3C6A814FE035788D1C34EAD39349B860" $dll
+          $tools = Join-Path $env:LOCALAPPDATA "tauri"
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $tools -Force
+          $nsis = Join-Path $tools "NSIS"
+          Rename-Item -Path (Join-Path $tools "nsis-3.11") -NewName "NSIS"
+          $plugins = Join-Path $nsis "Plugins/x86-unicode/additional"
+          New-Item -ItemType Directory -Force -Path $plugins | Out-Null
+          Copy-Item -Path $dll -Destination (Join-Path $plugins "nsis_tauri_utils.dll")
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
