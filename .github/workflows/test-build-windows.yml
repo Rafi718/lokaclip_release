@@ -1,0 +1,89 @@
+name: Test build (Windows, not released)
+
+# Manual-only build of any lokaclip_desktop branch/commit for testing on a
+# real Windows machine. It creates NO release and NO latest.json, so installed
+# apps never see it: the installer is attached to this run as an artifact that
+# expires after a few days. Telemetry is off so test runs don't pollute the
+# dashboard.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "lokaclip_desktop branch, tag or commit to build"
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout private repository
+        uses: actions/checkout@v4
+        with:
+          repository: Rafi718/lokaclip_desktop
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Create .env file
+        shell: bash
+        run: |
+          echo "VITE_API_BASE_URL=https://api.lokaclip.pro/v1" > .env
+          echo "VITE_APP_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")-test" >> .env
+          echo "VITE_UPDATE_CHANNEL=stable" >> .env
+          echo "VITE_TELEMETRY_ENABLED=false" >> .env
+
+      - run: pnpm install
+
+      # Same as build-and-release.yml: Smart Crop and local Whisper need the
+      # Visual C++ runtime bundled.
+      - name: Bundle the Visual C++ runtime
+        shell: pwsh
+        run: |
+          $dest = "src-tauri/resources/vcruntime"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $src = Get-ChildItem -Directory -ErrorAction SilentlyContinue `
+            "C:\Program Files*\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $src) { throw "VC redist folder not found on this runner" }
+          foreach ($f in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","msvcp140_1.dll")) {
+            $p = Join-Path $src.FullName $f
+            if (-not (Test-Path $p)) { throw "missing $f in $($src.FullName)" }
+            Copy-Item $p $dest -Force
+          }
+          $omp = Get-ChildItem -Directory -ErrorAction SilentlyContinue `
+            (Join-Path (Split-Path $src.FullName) "Microsoft.VC*.OpenMP") |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $omp) { throw "OpenMP redist folder not found next to $($src.FullName)" }
+          Copy-Item (Join-Path $omp.FullName "vcomp140.dll") $dest -Force
+
+      # Production device key, or the API refuses the free trial on login.
+      - name: Build Tauri app (no release)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          LOKACLIP_DEVICE_KEY: ${{ secrets.LOKACLIP_DEVICE_KEY }}
+          LOKACLIP_DEVICE_KID: ${{ secrets.LOKACLIP_DEVICE_KID }}
+        with:
+          retryAttempts: 3
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: lokaclip-windows-test-${{ github.run_number }}
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          retention-days: 3
+          if-no-files-found: error
